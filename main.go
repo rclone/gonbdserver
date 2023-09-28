@@ -2,7 +2,7 @@ package main
 
 import (
 	"flag"
-	"github.com/abligh/gonbdserver/nbd"
+	"github.com/ncw/gonbdserver/nbd"
 )
 
 // main() is the main program entry

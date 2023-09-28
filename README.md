@@ -1,9 +1,15 @@
-# gonbdserver [![Build Status](https://travis-ci.org/abligh/gonbdserver.svg?branch=master)](https://travis-ci.org/abligh/gonbdserver) [![GoDoc](http://godoc.org/github.com/abligh/gonbdserver?status.png)](http://godoc.org/github.com/abligh/gonbdserver/nbd) [![GitHub release](https://img.shields.io/github/release/abligh/gonbdserver.svg)](https://github.com/abligh/gonbdserver/releases)
+# gonbdserver
 
 `gonbdserver` is an NBD server written in Go. Its purpose is not to
 be especially performant, but rather to act as a simple demonstration
 of the implementation of the NBD protocol. That said, where tested
 it appears to be at least as fast as the reference nbdserver implementation.
+
+This is a fork of the original https://github.com/abligh/gonbdserver
+which doesn't appear to be maintained any more.
+
+The purpose of the fork is to allow servers and backends to be
+implemented externally of this package.
 
 Features
 --------
@@ -15,13 +21,10 @@ Features
   
 * **TLS support**. With client certificates if required.
 
-* **Ceph RBD support**. Almost entirely untested.
-
 * **Linux AIO support**. Experimental.
 
-* **Pluggable backends**. By default a file backend is provided, as well as
-  a Ceph/RBD backend on linux, but it would be possible to supply any backend.
-  The ceph driver is there mostly to illustrate just how easy this is.
+* **Pluggable backends**. By default a file backend is provided but it
+  would be possible to supply any backend.
 
 * **Reloadable configuration**. It is possible to reload the configuration
   using `SIGHUP` without affecting existing servers.
@@ -162,15 +165,6 @@ The `aiofile` driver reads the disk from a file on the host OS's disks using AIO
 
 * `path:` path to the file. Mandatory.
 * `sync:` set to `true` to open the file with `O_SYNC`, else to `false`. Optional, defaults to `false`.
-
-The `rbd` driver reads the disk from Ceph. It relies on your `ceph.conf` file being set up correctly, and has the following options:
-
-* `image:` RBD name of image. Mandatory.
-* `pool:` RBD pool for image. Optional, defaults to `rbd`.
-* `cluster:` ceph cluster name. Defaults to `ceph`.
-* `user:` ceph user name. Defaults to `client.admin`.
-
-*Note the Ceph driver is almost entirely untested*
 
 #### `tls` item
 
