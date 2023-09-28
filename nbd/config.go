@@ -16,6 +16,7 @@ type ServerConfig struct {
 	Exports         []ExportConfig // array of configurations of exported items
 	TLS             TLSConfig      // TLS configuration
 	DisableNoZeroes bool           // Disable NoZereos extension
+	Debug           bool           // Set for verbose logging of Tx and Rx packets
 }
 
 // ExportConfig holds the config for one exported item

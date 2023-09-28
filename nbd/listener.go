@@ -25,6 +25,7 @@ type Listener struct {
 	tls             TLSConfig      // the TLS configuration
 	tlsconfig       *tls.Config    // the TLS configuration
 	disableNoZeroes bool           // disable the 'no zeroes' extension
+	debug           bool           // verbose output
 }
 
 // DeadlineListener is a listener type that does what we want
@@ -86,7 +87,7 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 			l.logger.Printf("[ERROR] Error %s listening on %s", err, addr)
 		} else {
 			l.logger.Printf("[INFO] Connect to %s from %s", addr, conn.RemoteAddr())
-			if connection, err := newConnection(l, l.logger, conn); err != nil {
+			if connection, err := newConnection(l, l.logger, conn, l.debug); err != nil {
 				l.logger.Printf("[ERROR] Error %s establishing connection to %s from %s", err, addr, conn.RemoteAddr())
 				_ = conn.Close()
 			} else {
@@ -184,6 +185,7 @@ func NewListener(logger *log.Logger, s ServerConfig) (*Listener, error) {
 		defaultExport:   s.DefaultExport,
 		disableNoZeroes: s.DisableNoZeroes,
 		tls:             s.TLS,
+		debug:           s.Debug,
 	}
 	if err := l.initTLS(); err != nil {
 		return nil, err

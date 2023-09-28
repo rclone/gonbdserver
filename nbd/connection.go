@@ -67,6 +67,8 @@ type Connection struct {
 	killCh    chan struct{} // closed by workers to indicate a hard close is required
 	killed    bool          // true if killCh closed already
 	killMutex sync.Mutex    // protects killed
+
+	debug bool // set for output of Tx and Rx packets
 }
 
 // Backend is an interface implemented by the various backend drivers
@@ -114,7 +116,7 @@ type RequestReply struct {
 }
 
 // newConection returns a new Connection object
-func newConnection(listener *Listener, logger *log.Logger, conn net.Conn) (*Connection, error) {
+func newConnection(listener *Listener, logger *log.Logger, conn net.Conn, debug bool) (*Connection, error) {
 	params := &ConnectionParameters{
 		ConnectionTimeout: time.Second * 5,
 	}
@@ -123,6 +125,7 @@ func newConnection(listener *Listener, logger *log.Logger, conn net.Conn) (*Conn
 		listener:  listener,
 		logger:    logger,
 		params:    params,
+		debug:     debug,
 	}
 	return c, nil
 }
@@ -270,6 +273,52 @@ func (c *Connection) ReturnMemory(ctx context.Context) {
 	}
 }
 
+func (c *Connection) binaryRead(r io.Reader, order binary.ByteOrder, data any) error {
+	err := binary.Read(r, order, data)
+	if err != nil {
+		c.logger.Printf("[DEBUG] binary read failed: %v", err)
+		return err
+	}
+	if c.debug {
+		switch p := data.(type) {
+		case *uint64:
+			c.logger.Printf("[DEBUG] Rx: 0x%016x", *p)
+		case *uint32:
+			c.logger.Printf("[DEBUG] Rx: 0x%08x", *p)
+		case *uint16:
+			c.logger.Printf("[DEBUG] Rx: 0x%04x", *p)
+		case *uint8:
+			c.logger.Printf("[DEBUG] Rx: 0x%02x", *p)
+		default:
+			c.logger.Printf("[DEBUG] Rx: %#v", data)
+		}
+	}
+	return nil
+}
+
+func (c *Connection) binaryWrite(w io.Writer, order binary.ByteOrder, data any) error {
+	if c.debug {
+		switch p := data.(type) {
+		case uint64:
+			c.logger.Printf("[DEBUG] Tx: 0x%016x", p)
+		case uint32:
+			c.logger.Printf("[DEBUG] Tx: 0x%08x", p)
+		case uint16:
+			c.logger.Printf("[DEBUG] Tx: 0x%04x", p)
+		case uint8:
+			c.logger.Printf("[DEBUG] Tx: 0x%02x", p)
+		default:
+			c.logger.Printf("[DEBUG] Tx: %#v", data)
+		}
+	}
+	err := binary.Write(w, order, data)
+	if err != nil {
+		c.logger.Printf("[DEBUG] binary write failed: %v", err)
+		return err
+	}
+	return nil
+}
+
 // Receive is the goroutine that handles decoding connection data from the socket
 func (c *Connection) Receive(ctx context.Context) {
 	defer func() {
@@ -279,7 +328,7 @@ func (c *Connection) Receive(ctx context.Context) {
 	}()
 	for {
 		req := RequestReply{}
-		if err := binary.Read(c.conn, binary.BigEndian, &req.nbdReq); err != nil {
+		if err := c.binaryRead(c.conn, binary.BigEndian, &req.nbdReq); err != nil {
 			if nerr, ok := err.(net.Error); ok {
 				if nerr.Timeout() {
 					c.logger.Printf("[INFO] Client %s timeout, closing connection", c.name)
@@ -559,7 +608,7 @@ func (c *Connection) Transmit(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if err := binary.Write(c.conn, binary.BigEndian, req.nbdRep); err != nil {
+			if err := c.binaryWrite(c.conn, binary.BigEndian, req.nbdRep); err != nil {
 				c.logger.Printf("[ERROR] Client %s can not write reply", c.name)
 				return
 			}
@@ -706,23 +755,23 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 		nsh.GlobalFlags |= FlagNoZeroes
 	}
 
-	if err := binary.Write(c.conn, binary.BigEndian, nsh); err != nil {
-		return errors.New("can not write magic header")
+	if err := c.binaryWrite(c.conn, binary.BigEndian, nsh); err != nil {
+		return fmt.Errorf("can not write magic header: %w", err)
 	}
 
 	// next they send client flags
 	var clf ClientFlags
 
-	if err := binary.Read(c.conn, binary.BigEndian, &clf); err != nil {
-		return errors.New("can not read client flags")
+	if err := c.binaryRead(c.conn, binary.BigEndian, &clf); err != nil {
+		return fmt.Errorf("can not read client flags: %w", err)
 	}
 
 	done := false
 	// now we get options
 	for !done {
 		var opt ClientOpt
-		if err := binary.Read(c.conn, binary.BigEndian, &opt); err != nil {
-			return errors.New("can not read option (perhaps client dropped the connection)")
+		if err := c.binaryRead(c.conn, binary.BigEndian, &opt); err != nil {
+			return fmt.Errorf("can not read option (perhaps client dropped the connection): %w", err)
 		}
 		if opt.Magic != OptsMagic {
 			return errors.New("bad option magic")
@@ -747,8 +796,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				}
 			} else {
 				var nameLength uint32
-				if err := binary.Read(c.conn, binary.BigEndian, &nameLength); err != nil {
-					return errors.New("bad export name length")
+				if err := c.binaryRead(c.conn, binary.BigEndian, &nameLength); err != nil {
+					return fmt.Errorf("bad export name length: %w", err)
 				}
 				if nameLength > 4096 {
 					return errors.New("name is too long")
@@ -762,13 +811,13 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					return errors.New("incomplete name")
 				}
 				var numInfoElements uint16
-				if err := binary.Read(c.conn, binary.BigEndian, &numInfoElements); err != nil {
-					return errors.New("bad number of info elements")
+				if err := c.binaryRead(c.conn, binary.BigEndian, &numInfoElements); err != nil {
+					return fmt.Errorf("bad number of info elements: %w", err)
 				}
 				for i := uint16(0); i < numInfoElements; i++ {
 					var infoElement uint16
-					if err := binary.Read(c.conn, binary.BigEndian, &infoElement); err != nil {
-						return errors.New("bad number of info elements")
+					if err := c.binaryRead(c.conn, binary.BigEndian, &infoElement); err != nil {
+						return fmt.Errorf("bad number of info elements: %w", err)
 					}
 					switch infoElement {
 					case NbdInfoBlockSize:
@@ -808,8 +857,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				if err == nil {
 					or.Type = RepErrTLSReqd
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not send info error")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not send info error: %w", err)
 				}
 				break
 			}
@@ -829,8 +878,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepErrUnknown,
 					Length: 0,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not send info error")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not send info error: %w", err)
 				}
 				break
 			}
@@ -845,8 +894,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Size:  export.size,
 					Flags: export.exportFlags,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, ed); err != nil {
-					return errors.New("can not write export details")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, ed); err != nil {
+					return fmt.Errorf("can not write export details: %w", err)
 				}
 			} else {
 				// Send NBD_INFO_EXPORT
@@ -856,16 +905,16 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepInfo,
 					Length: 12,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not write info export pt1")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not write info export pt1: %w", err)
 				}
 				ir := InfoExport{
 					InfoType:          NbdInfoExport,
 					ExportSize:        export.size,
 					TransmissionFlags: export.exportFlags,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, ir); err != nil {
-					return errors.New("can not write info export pt2")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, ir); err != nil {
+					return fmt.Errorf("can not write info export pt2: %w", err)
 				}
 
 				// Send NBD_INFO_NAME
@@ -875,14 +924,14 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepInfo,
 					Length: uint32(2 + len(name)),
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not write info name pt1")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not write info name pt1: %w", err)
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, uint16(NbdInfoName)); err != nil {
-					return errors.New("can not write name id")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, uint16(NbdInfoName)); err != nil {
+					return fmt.Errorf("can not write name id: %w", err)
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, name); err != nil {
-					return errors.New("can not write name")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, name); err != nil {
+					return fmt.Errorf("can not write name: %w", err)
 				}
 
 				// Send NBD_INFO_DESCRIPTION
@@ -892,14 +941,14 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepInfo,
 					Length: uint32(2 + len(description)),
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not write info description pt1")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not write info description pt1: %w", err)
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, uint16(NbdInfoDescription)); err != nil {
-					return errors.New("can not write description id")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, uint16(NbdInfoDescription)); err != nil {
+					return fmt.Errorf("can not write description id: %w", err)
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, description); err != nil {
-					return errors.New("can not write description")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, description); err != nil {
+					return fmt.Errorf("can not write description: %w", err)
 				}
 
 				// Send NBD_INFO_BLOCK_SIZE
@@ -909,8 +958,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepInfo,
 					Length: 14,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not write info block size pt1")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not write info block size pt1: %w", err)
 				}
 				ir2 := InfoBlockSize{
 					InfoType:           NbdInfoBlockSize,
@@ -918,13 +967,14 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					PreferredBlockSize: uint32(export.preferredBlockSize),
 					MaximumBlockSize:   uint32(export.maximumBlockSize),
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, ir2); err != nil {
-					return errors.New("can not write info block size pt2")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, ir2); err != nil {
+					return fmt.Errorf("can not write info block size pt2: %w", err)
 				}
 
 				replyType := RepAck
 
 				if export.minimumBlockSize > 1 && !clientSupportsBlockSizeConstraints {
+					c.logger.Printf("[ERROR] block size negotiation failed - need ndb-client -g to force NBD_OPT_EXPORT_NAME protocol")
 					replyType = RepErrBlockSizeReqd
 				}
 
@@ -935,8 +985,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   replyType,
 					Length: 0,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not info ack")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not info ack: %w", err)
 				}
 				if opt.ID == OptInfo || or.Type&RepFlagError != 0 {
 					// Disassociate the backend as we are not closing
@@ -949,8 +999,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 			if clf.Flags&FlagCNoZeroes == 0 && opt.ID == OptExportName {
 				// send 124 bytes of zeroes.
 				zeroes := make([]byte, 124)
-				if err := binary.Write(c.conn, binary.BigEndian, zeroes); err != nil {
-					return errors.New("can not write zeroes")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, zeroes); err != nil {
+					return fmt.Errorf("can not write zeroes: %w", err)
 				}
 			}
 			c.export = export
@@ -965,15 +1015,15 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepServer,
 					Length: uint32(len(name) + 4),
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not send list item")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not send list item: %w", err)
 				}
 				l := uint32(len(name))
-				if err := binary.Write(c.conn, binary.BigEndian, l); err != nil {
-					return errors.New("can not send list name length")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, l); err != nil {
+					return fmt.Errorf("can not send list name length: %w", err)
 				}
 				if n, err := c.conn.Write(name); err != nil || n != len(name) {
-					return errors.New("can not send list name")
+					return fmt.Errorf("can not send list name: %w", err)
 				}
 			}
 			or := OptReply{
@@ -982,8 +1032,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				Type:   RepAck,
 				Length: 0,
 			}
-			if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-				return errors.New("can not send list ack")
+			if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+				return fmt.Errorf("can not send list ack: %w", err)
 			}
 		case OptStarttls:
 			if c.listener.tlsconfig == nil || c.tlsConn != nil {
@@ -998,8 +1048,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				if c.tlsConn != nil { // TLS is already negotiated
 					or.Type = RepErrInvalid
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not reply to unsupported TLS option")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not reply to unsupported TLS option: %w", err)
 				}
 			} else {
 				or := OptReply{
@@ -1008,8 +1058,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 					Type:   RepAck,
 					Length: 0,
 				}
-				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-					return errors.New("can not send TLS ack")
+				if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+					return fmt.Errorf("can not send TLS ack: %w", err)
 				}
 				c.logger.Printf("[INFO] Upgrading connection with %s to TLS", c.name)
 				// switch over to TLS
@@ -1028,8 +1078,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				Type:   RepAck,
 				Length: 0,
 			}
-			if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-				return errors.New("can not send abort ack")
+			if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+				return fmt.Errorf("can not send abort ack: %w", err)
 			}
 			return errors.New("Connection aborted by client")
 		default:
@@ -1044,8 +1094,8 @@ func (c *Connection) Negotiate(ctx context.Context) error {
 				Type:   RepErrUnsup,
 				Length: 0,
 			}
-			if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
-				return errors.New("can not reply to unsupported option")
+			if err := c.binaryWrite(c.conn, binary.BigEndian, or); err != nil {
+				return fmt.Errorf("can not reply to unsupported option: %w", err)
 			}
 		}
 	}
