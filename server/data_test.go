@@ -1,4 +1,4 @@
-package nbd
+package server
 
 import (
 	"bytes"
@@ -51,6 +51,9 @@ func genTestCertificate() (key, cert string) {
 	)
 
 	priv, err := rsa.GenerateKey(rand.Reader, rsaBits)
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate random number: %s", err))
+	}
 
 	notBefore := time.Now()
 	notAfter := notBefore.Add(time.Hour)
@@ -88,12 +91,18 @@ func genTestCertificate() (key, cert string) {
 	}
 
 	var certOut bytes.Buffer
-	pem.Encode(&certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	cert = string(certOut.Bytes())
+	err = pem.Encode(&certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	if err != nil {
+		panic(fmt.Sprintf("Failed to PEM encode certificate: %s", err))
+	}
+	cert = certOut.String()
 
 	var keyOut bytes.Buffer
-	pem.Encode(&keyOut, pemBlockForKey(priv))
-	key = string(keyOut.Bytes())
+	err = pem.Encode(&keyOut, pemBlockForKey(priv))
+	if err != nil {
+		panic(fmt.Sprintf("Failed to PEM encode key: %s", err))
+	}
+	key = keyOut.String()
 
 	return
 }

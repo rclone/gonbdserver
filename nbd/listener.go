@@ -5,29 +5,29 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"golang.org/x/net/context"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
-// A single listener on a given net.Conn address
+// Listener is a single listener on a given net.Conn address
 type Listener struct {
 	logger          *log.Logger    // a logger
 	protocol        string         // the protocol we are listening on
 	addr            string         // the address
 	exports         []ExportConfig // a list of export configurations associated
 	defaultExport   string         // name of default export
-	tls             TlsConfig      // the TLS configuration
+	tls             TLSConfig      // the TLS configuration
 	tlsconfig       *tls.Config    // the TLS configuration
 	disableNoZeroes bool           // disable the 'no zeroes' extension
 }
 
-// An listener type that does what we want
+// DeadlineListener is a listener type that does what we want
 type DeadlineListener interface {
 	SetDeadline(t time.Time) error
 	net.Listener
@@ -59,7 +59,7 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 
 	defer func() {
 		l.logger.Printf("[INFO] Stopping listening on %s", addr)
-		nli.Close()
+		_ = nli.Close()
 	}()
 
 	li, ok := nli.(DeadlineListener)
@@ -75,7 +75,10 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 			return
 		default:
 		}
-		li.SetDeadline(time.Now().Add(time.Second))
+		err := li.SetDeadline(time.Now().Add(time.Second))
+		if err != nil {
+			l.logger.Printf("[ERROR] failed to set deadline: %v", err)
+		}
 		if conn, err := li.Accept(); err != nil {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
 				continue
@@ -85,7 +88,7 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 			l.logger.Printf("[INFO] Connect to %s from %s", addr, conn.RemoteAddr())
 			if connection, err := newConnection(l, l.logger, conn); err != nil {
 				l.logger.Printf("[ERROR] Error %s establishing connection to %s from %s", err, addr, conn.RemoteAddr())
-				conn.Close()
+				_ = conn.Close()
 			} else {
 				go func() {
 					// do not use our parent ctx as a context, as we don't want it to cancel when
@@ -103,7 +106,7 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 }
 
 // make an appropriate TLS config
-func (l *Listener) initTls() error {
+func (l *Listener) initTLS() error {
 	keyFile := l.tls.KeyFile
 	if keyFile == "" {
 		return nil // no TLS
@@ -120,12 +123,12 @@ func (l *Listener) initTls() error {
 	var clientCAs *x509.CertPool
 	if l.tls.CaCertFile != "" {
 		clientCAs = x509.NewCertPool()
-		clientCAbytes, err := ioutil.ReadFile(l.tls.CaCertFile)
+		clientCAbytes, err := os.ReadFile(l.tls.CaCertFile)
 		if err != nil {
 			return err
 		}
 		if ok := clientCAs.AppendCertsFromPEM(clientCAbytes); !ok {
-			return errors.New("Could not append CA certficates from PEM file")
+			return errors.New("could not append CA certficates from PEM file")
 		}
 	}
 
@@ -142,13 +145,13 @@ func (l *Listener) initTls() error {
 	if l.tls.MinVersion != "" {
 		minVersion, ok = tlsVersionMap[strings.ToLower(l.tls.MinVersion)]
 		if !ok {
-			return fmt.Errorf("Bad minimum TLS version: '%s'", l.tls.MinVersion)
+			return fmt.Errorf("bad minimum TLS version: '%s'", l.tls.MinVersion)
 		}
 	}
 	if l.tls.MaxVersion != "" {
 		minVersion, ok = tlsVersionMap[strings.ToLower(l.tls.MaxVersion)]
 		if !ok {
-			return fmt.Errorf("Bad maximum TLS version: '%s'", l.tls.MaxVersion)
+			return fmt.Errorf("bad maximum TLS version: '%s'", l.tls.MaxVersion)
 		}
 	}
 
@@ -156,7 +159,7 @@ func (l *Listener) initTls() error {
 	if l.tls.ClientAuth != "" {
 		clientAuth, ok = tlsClientAuthMap[strings.ToLower(l.tls.ClientAuth)]
 		if !ok {
-			return fmt.Errorf("Bad TLS client auth type: '%s'", l.tls.ClientAuth)
+			return fmt.Errorf("bad TLS client auth type: '%s'", l.tls.ClientAuth)
 		}
 	}
 
@@ -180,9 +183,9 @@ func NewListener(logger *log.Logger, s ServerConfig) (*Listener, error) {
 		exports:         s.Exports,
 		defaultExport:   s.DefaultExport,
 		disableNoZeroes: s.DisableNoZeroes,
-		tls:             s.Tls,
+		tls:             s.TLS,
 	}
-	if err := l.initTls(); err != nil {
+	if err := l.initTLS(); err != nil {
 		return nil, err
 	}
 	return l, nil

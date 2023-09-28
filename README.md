@@ -61,7 +61,7 @@ Usage of ./gonbdserver:
 
 By default `gonbdserver` runs as a daemon. You can use `-f` to make it run in the foreground.
 If you are running on Linux and want to run from `init`, you may wish to consider using
-`start-stop-daemon` with the `-b` flag, and invoking `gondbserver` with the `-f` flag,
+`start-stop-daemon` with the `-b` flag, and invoking `gonbdserver` with the `-f` flag,
 as `start-stop-daemon` is probably better at dealing with the many possible failure modes.
 
 When running in foreground mode, the `pid` file is not used, and `-s` is irrelevant.

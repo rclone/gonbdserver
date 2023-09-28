@@ -1,0 +1,440 @@
+// Package server provides the implementation of the NBD command line server.
+package server
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"log/syslog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/rclone/gonbdserver/nbd"
+	"github.com/sevlyar/go-daemon"
+	"gopkg.in/yaml.v2"
+)
+
+/* Example configuration:
+
+servers:
+- protocol: tcp
+  address: 127.0.0.1:6666
+  exports:
+  - name: foo
+    driver: file
+    path: /tmp/test
+    workers: 5
+  - name: bar
+    readonly: true
+    driver: rbd
+    rdbname: rbdbar
+    timeout: 5s
+- protocol: unix
+  address: /var/run/nbd.sock
+  exports:
+  - name: baz
+    driver: file
+    readonly: false
+    path: /tmp/baz
+    sync: true
+logging:
+  syslogfacility: local1
+*/
+
+// Location of the config file on disk; overridden by flags
+var configFile = flag.String("c", "/etc/gonbdserver.conf", "Path to YAML config file")
+var pidFile = flag.String("p", "/var/run/gonbdserver.pid", "Path to PID file")
+var sendSignal = flag.String("s", "", "Send signal to daemon (either \"stop\" or \"reload\")")
+var foreground = flag.Bool("f", false, "Run in foreground (not as daemon)")
+var pprof = flag.Bool("pprof", false, "Run pprof")
+
+const (
+	envConfFile = "_GONBDSERVER_CONFFILE"
+	envPidFile  = "_GONBDSERVER_PIDFILE"
+)
+
+// Config holds the config that applies to all servers (currently just logging), and an array of server configs
+type Config struct {
+	Servers []nbd.ServerConfig // array of server configs
+	Logging LogConfig          // Configuration for logging
+}
+
+// LogConfig specifies configuration for logging
+type LogConfig struct {
+	File           string // a file to log to
+	FileMode       string // file mode
+	SyslogFacility string // a syslog facility name - set to enable syslog
+	Date           bool   // log the date - i.e. log.Ldate
+	Time           bool   // log the time - i.e. log.Ltime
+	Microseconds   bool   // log microseconds - i.e. log.Lmicroseconds
+	UTC            bool   // log time in URC - i.e. LUTC
+	SourceFile     bool   // log source file - i.e. Lshortfile
+}
+
+// SyslogWriter is a WriterCloser that logs to syslog with an extracted priority
+type SyslogWriter struct {
+	w *syslog.Writer
+}
+
+// facilityMap maps textual
+var facilityMap = map[string]syslog.Priority{
+	"kern":     syslog.LOG_KERN,
+	"user":     syslog.LOG_USER,
+	"mail":     syslog.LOG_MAIL,
+	"daemon":   syslog.LOG_DAEMON,
+	"auth":     syslog.LOG_AUTH,
+	"syslog":   syslog.LOG_SYSLOG,
+	"lpr":      syslog.LOG_LPR,
+	"news":     syslog.LOG_NEWS,
+	"uucp":     syslog.LOG_UUCP,
+	"cron":     syslog.LOG_CRON,
+	"authpriv": syslog.LOG_AUTHPRIV,
+	"ftp":      syslog.LOG_FTP,
+	"local0":   syslog.LOG_LOCAL0,
+	"local1":   syslog.LOG_LOCAL1,
+	"local2":   syslog.LOG_LOCAL2,
+	"local3":   syslog.LOG_LOCAL3,
+	"local4":   syslog.LOG_LOCAL4,
+	"local5":   syslog.LOG_LOCAL5,
+	"local6":   syslog.LOG_LOCAL6,
+	"local7":   syslog.LOG_LOCAL7,
+}
+
+// NewSyslogWriter creates a new syslog writer
+func NewSyslogWriter(facility string) (*SyslogWriter, error) {
+	f := syslog.LOG_DAEMON
+	if ff, ok := facilityMap[facility]; ok {
+		f = ff
+	}
+	w, err := syslog.New(f|syslog.LOG_INFO, "gonbdserver:")
+	if err != nil {
+		return nil, err
+	}
+	return &SyslogWriter{
+		w: w,
+	}, nil
+}
+
+// Close the channel
+func (s *SyslogWriter) Close() error {
+	return s.w.Close()
+}
+
+var deletePrefix = regexp.MustCompile(`gonbdserver:`)
+var replaceLevel = regexp.MustCompile(`\[[A-Z]+\] `)
+
+// Write to the syslog, removing the prefix and setting the appropriate level
+func (s *SyslogWriter) Write(p []byte) (n int, err error) {
+	p1 := deletePrefix.ReplaceAllString(string(p), "")
+	level := ""
+	tolog := replaceLevel.ReplaceAllStringFunc(p1, func(l string) string {
+		level = l
+		return ""
+	})
+	switch level {
+	case "[DEBUG] ":
+		err = s.w.Debug(tolog)
+	case "[INFO] ":
+		err = s.w.Info(tolog)
+	case "[NOTICE] ":
+		err = s.w.Notice(tolog)
+	case "[WARNING] ", "[WARN] ":
+		err = s.w.Warning(tolog)
+	case "[ERROR] ", "[ERR] ":
+		err = s.w.Err(tolog)
+	case "[CRIT] ":
+		err = s.w.Crit(tolog)
+	case "[ALERT] ":
+		err = s.w.Alert(tolog)
+	case "[EMERG] ":
+		err = s.w.Emerg(tolog)
+	default:
+		err = s.w.Notice(tolog)
+	}
+	return len(p), err
+}
+
+// ParseConfig parses the YAML configuration provided
+func ParseConfig() (*Config, error) {
+	buf, err := os.ReadFile(*configFile)
+	if err != nil {
+		return nil, err
+	}
+	c := &Config{}
+	if err := yaml.Unmarshal(buf, c); err != nil {
+		return nil, err
+	}
+	for i := range c.Servers {
+		if c.Servers[i].Protocol == "" {
+			c.Servers[i].Protocol = "tcp"
+		}
+		if c.Servers[i].Protocol == "tcp" && c.Servers[i].Address == "" {
+			c.Servers[i].Protocol = fmt.Sprintf("0.0.0.0:%d", nbd.DefaultPort)
+		}
+	}
+	return c, nil
+}
+
+// GetLogger gets a logger for local use
+func (c *Config) GetLogger() (*log.Logger, io.Closer, error) {
+	logFlags := 0
+	if c.Logging.Date {
+		logFlags |= log.Ldate
+	}
+	if c.Logging.Time {
+		logFlags |= log.Ltime
+	}
+	if c.Logging.Microseconds {
+		logFlags |= log.Lmicroseconds
+	}
+	if c.Logging.SourceFile {
+		logFlags |= log.Lshortfile
+	}
+	if c.Logging.File != "" {
+		mode := os.FileMode(0644)
+		if c.Logging.FileMode != "" {
+			i, err := strconv.ParseInt(c.Logging.FileMode, 8, 32)
+			if err != nil {
+				return nil, nil, fmt.Errorf("can not read file logging mode: %v", err)
+			}
+			mode = os.FileMode(i)
+		}
+		file, err := os.OpenFile(c.Logging.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, mode)
+		if err != nil {
+			return nil, nil, err
+		}
+		return log.New(file, "gonbdserver:", logFlags), file, nil
+	}
+	if c.Logging.SyslogFacility != "" {
+		s, err := NewSyslogWriter(c.Logging.SyslogFacility)
+		if err != nil {
+			return nil, nil, err
+		}
+		return log.New(s, "gonbdserver:", logFlags), s, nil
+	}
+	return log.New(os.Stderr, "gonbdserver:", logFlags), nil, nil
+}
+
+// Control the running goroutine
+type Control struct {
+	quit chan struct{}
+}
+
+// RunConfig - this is effectively the main entry point of the program
+//
+// We parse the config, then start each of the listeners, restarting them when we get SIGHUP, but being sure not to kill the sessions
+func RunConfig(control *Control) {
+	// just until we read the configuration
+	logger := log.New(os.Stderr, "gonbdserver:", log.LstdFlags)
+	var logCloser io.Closer
+	var sessionWaitGroup sync.WaitGroup
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	defer func() {
+		logger.Println("[INFO] Shutting down")
+		cancelFunc()
+		sessionWaitGroup.Wait()
+		logger.Println("[INFO] Shutdown complete")
+		if logCloser != nil {
+			_ = logCloser.Close()
+		}
+	}()
+
+	intr := make(chan os.Signal, 1)
+	term := make(chan os.Signal, 1)
+	hup := make(chan os.Signal, 1)
+	usr1 := make(chan os.Signal, 1)
+	defer close(intr)
+	defer close(term)
+	defer close(hup)
+	defer close(usr1)
+	if control == nil {
+		signal.Notify(intr, os.Interrupt)
+		signal.Notify(term, syscall.SIGTERM)
+		signal.Notify(hup, syscall.SIGHUP)
+	}
+
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		for range usr1 {
+			logger.Println("[INFO] Run GC()")
+			runtime.GC()
+			logger.Println("[INFO] GC() done")
+			debug.FreeOSMemory()
+			logger.Println("[INFO] FreeOsMemory() done")
+		}
+	}()
+
+	for {
+		var wg sync.WaitGroup
+		configCtx, configCancelFunc := context.WithCancel(ctx)
+		c, err := ParseConfig()
+		if err != nil {
+			logger.Printf("[ERROR] Cannot parse configuration file: %v", err)
+			configCancelFunc()
+			return
+		}
+		if nlogger, nlogCloser, err := c.GetLogger(); err != nil {
+			logger.Printf("[ERROR] Could not load logger: %v", err)
+		} else {
+			if logCloser != nil {
+				_ = logCloser.Close()
+			}
+			logger = nlogger
+			logCloser = nlogCloser
+		}
+		logger.Printf("[INFO] Loaded configuration. Available backends: %s.", strings.Join(nbd.GetBackendNames(), ", "))
+		for _, s := range c.Servers {
+			s := s // localise loop variable
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				nbd.StartServer(configCtx, ctx, &sessionWaitGroup, logger, s)
+			}()
+		}
+
+		select {
+		case <-ctx.Done():
+			logger.Println("[INFO] Interrupted")
+			configCancelFunc()
+			return
+		case <-intr:
+			logger.Println("[INFO] Interrupt signal received")
+			configCancelFunc()
+			return
+		case <-term:
+			logger.Println("[INFO] Terminate signal received")
+			configCancelFunc()
+			return
+		case <-control.quit:
+			logger.Println("[INFO] Programmatic quit received")
+			configCancelFunc()
+			return
+		case <-hup:
+			logger.Println("[INFO] Reload signal received; reloading configuration which will be effective for new connections")
+			configCancelFunc() // kill the listeners but not the sessions
+			wg.Wait()
+		}
+	}
+}
+
+// Run the server
+func Run(control *Control) {
+	if control == nil {
+		control = &Control{}
+	}
+
+	// Just for this routine
+	logger := log.New(os.Stderr, "gonbdserver:", log.LstdFlags)
+
+	if *pprof {
+		runtime.MemProfileRate = 1
+		go func() {
+			err := http.ListenAndServe(":8080", nil)
+			if err != nil {
+				logger.Printf("[CRIT] Error starting pprof server: %s", err)
+			}
+		}()
+	}
+
+	daemon.AddFlag(daemon.StringFlag(sendSignal, "stop"), syscall.SIGTERM)
+	daemon.AddFlag(daemon.StringFlag(sendSignal, "reload"), syscall.SIGHUP)
+
+	if daemon.WasReborn() {
+		if val := os.Getenv(envConfFile); val != "" {
+			*configFile = val
+		}
+		if val := os.Getenv(envPidFile); val != "" {
+			*pidFile = val
+		}
+	}
+
+	var err error
+	if *configFile, err = filepath.Abs(*configFile); err != nil {
+		logger.Fatalf("[CRIT] Error canonicalising config file path: %s", err)
+	}
+	if *pidFile, err = filepath.Abs(*pidFile); err != nil {
+		logger.Fatalf("[CRIT] Error canonicalising pid file path: %v", err)
+	}
+
+	// check the configuration parses. We do nothing with this at this stage
+	// but it eliminates a problem where the log of the configuration failing
+	// is invisible when daemonizing naively (e.g. when no alternate log
+	// destination is supplied) and the config file cannot be read
+	if _, err := ParseConfig(); err != nil {
+		logger.Fatalf("[CRIT] Cannot parse configuration file: %v", err)
+		return
+	}
+
+	if *foreground {
+		RunConfig(control)
+		return
+	}
+
+	checkErr := func(err error) {
+		if err != nil {
+			logger.Fatalf("[CRIT] internal error: %v", err)
+		}
+	}
+
+	checkErr(os.Setenv(envConfFile, *configFile))
+	checkErr(os.Setenv(envPidFile, *pidFile))
+
+	// Define daemon context
+	d := &daemon.Context{
+		PidFileName: *pidFile,
+		PidFilePerm: 0644,
+		Umask:       027,
+	}
+
+	// Send commands if needed
+	if len(daemon.ActiveFlags()) > 0 {
+		p, err := d.Search()
+		if err != nil {
+			logger.Fatalf("[CRIT] Unable send signal to the daemon - not running")
+		}
+		if err := p.Signal(syscall.Signal(0)); err != nil {
+			logger.Fatalf("[CRIT] Unable send signal to the daemon - not running, perhaps PID file is stale")
+		}
+		checkErr(daemon.SendCommands(p))
+		return
+	}
+
+	if !daemon.WasReborn() {
+		if p, err := d.Search(); err == nil {
+			if err := p.Signal(syscall.Signal(0)); err == nil {
+				logger.Fatalf("[CRIT] Daemon is already running (pid %d)", p.Pid)
+			} else {
+				logger.Printf("[INFO] Removing stale PID file %s", *pidFile)
+				_ = os.Remove(*pidFile)
+			}
+		}
+	}
+
+	// Process daemon operations - send signal if present flag or daemonize
+	child, err := d.Reborn()
+	if err != nil {
+		logger.Fatalf("[CRIT] Daemonize: %s", err)
+	}
+	if child != nil {
+		return
+	}
+
+	defer func() {
+		_ = d.Release()
+		// for some reason this is not removing the pid file
+		_ = os.Remove(*pidFile)
+	}()
+
+	RunConfig(control)
+}
